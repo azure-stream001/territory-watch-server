@@ -1,0 +1,33 @@
+# Territory Watch Japan - Backend (Django + analysis)
+# Spec: プロトタイプ実装仕様書 2.1 技術スタック
+
+# Core
+Django>=4.2,<5
+djangorestframework>=3.14
+django-cors-headers>=4.3
+djangorestframework-simplejwt>=5.3
+drf-spectacular>=0.27
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+celery>=5.3
+redis>=5.0
+
+# 衛星画像処理 (spec 2.1)
+sentinelsat>=1.2
+rasterio>=1.3
+geopandas>=0.14
+Shapely>=2.0
+
+# 画像解析 (spec 2.1)
+opencv-python>=4.8
+scikit-image>=0.22
+numpy>=1.24
+
+# 機械学習 (spec 2.1)
+scikit-learn>=1.3
+xgboost>=2.0
+
+# 可視化 (spec 2.1)
+folium>=0.15
+matplotlib>=3.8
+plotly>=5.18
