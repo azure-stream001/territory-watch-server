@@ -1,4 +1,5 @@
 import io
+import datetime
 from pathlib import Path
 
 from django.conf import settings
@@ -7,6 +8,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from .models import SatelliteScene
 from .scene_preview import get_or_create_scene_preview, scene_has_tiles
@@ -151,6 +153,190 @@ def ndvi_change_view(request):
     if "error" in result:
         return Response(result, status=status.HTTP_502_BAD_GATEWAY)
     return Response(result, status=status.HTTP_200_OK)
+
+
+class QuickDetectView(APIView):
+    """
+    POST /api/quick-detect/
+
+    統合型クイック検出: エリアポリゴン + Before/After 年を受け取り
+    Sentinel-2 シーンを取得して3パネル比較画像を生成・返す。
+    前処理・検出・可視化をすべてバックエンドで完結し、画像URLと統計値を返す。
+
+    Request body (JSON):
+      footprint_wkt     : WKT POLYGON (必須)
+      center_lat        : float
+      center_lon        : float
+      before_year       : int  (default 2018)
+      after_year        : int  (default current year)
+      veg_threshold     : float (default 0.3)  NDVI > this → vegetation
+      ndvi_threshold    : float (default -0.3) change detection drop threshold
+      max_cloud_coverage: int   (default 30)
+      panel_size        : int   (default 512)  each panel's width/height in px
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):  # noqa: C901
+        data = request.data or {}
+
+        footprint_wkt = (data.get("footprint_wkt") or "").strip()
+        if not footprint_wkt:
+            return Response({"status": "error", "message": "footprint_wkt は必須です"}, status=400)
+
+        try:
+            center_lat = float(data.get("center_lat") or 34.9656)
+            center_lon = float(data.get("center_lon") or 139.1147)
+        except (TypeError, ValueError):
+            center_lat, center_lon = 34.9656, 139.1147
+
+        def _parse_iso_date(v) -> "datetime.date | None":
+            if not v:
+                return None
+            if isinstance(v, datetime.date) and not isinstance(v, datetime.datetime):
+                return v
+            try:
+                return datetime.date.fromisoformat(str(v))
+            except Exception:
+                return None
+
+        before_date = _parse_iso_date(data.get("before_date"))
+        after_date = _parse_iso_date(data.get("after_date"))
+
+        current_year = datetime.date.today().year
+        try:
+            before_year = int(data.get("before_year") or 2018)
+            after_year  = int(data.get("after_year")  or current_year)
+        except (TypeError, ValueError):
+            before_year, after_year = 2018, current_year
+
+        try:
+            veg_threshold  = float(data.get("veg_threshold")  or 0.3)
+            max_cloud      = int(data.get("max_cloud_coverage") or 30)
+            panel_size     = int(data.get("panel_size") or 512)
+        except (TypeError, ValueError):
+            veg_threshold, max_cloud, panel_size = 0.3, 30, 512
+
+        # ── 1. Create a persistent Area so SatelliteScene FK is satisfied ─────
+        from areas.models import Area
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        area = Area.objects.create(
+            name=f"クイック検出 {ts}",
+            footprint_wkt=footprint_wkt,
+            center_lat=center_lat,
+            center_lon=center_lon,
+        )
+
+        # ── 2. Fetch Before scene ─────────────────────────────────────────────
+        from .services import fetch_scene_in_window
+        cloud_cover = (0, max(0, min(100, max_cloud)))
+
+        # If explicit dates are provided, search within a small window around them.
+        # Otherwise, fall back to a full-year search (legacy behaviour).
+        try:
+            window_days = int(data.get("window_days") or 45)
+        except (TypeError, ValueError):
+            window_days = 45
+
+        if before_date:
+            before_start = before_date - datetime.timedelta(days=window_days)
+            before_end   = before_date + datetime.timedelta(days=window_days)
+        else:
+            before_start = datetime.date(before_year, 1, 1)
+            before_end   = datetime.date(before_year, 12, 31)
+
+        if after_date:
+            after_start = after_date - datetime.timedelta(days=window_days)
+            after_end   = after_date + datetime.timedelta(days=window_days)
+        else:
+            after_start  = datetime.date(after_year,  1, 1)
+            after_end    = datetime.date(after_year,  12, 31)
+
+        try:
+            scene_before = fetch_scene_in_window(
+                area, before_start, before_end,
+                cloud_cover=cloud_cover, prefer_earliest=True,
+            )
+        except Exception as e:
+            area.delete()
+            return Response(
+                {"status": "error", "message": f"Before シーン取得中にエラー: {e}"},
+                status=200,
+            )
+
+        if not scene_before or scene_before.status != "downloaded":
+            area.delete()
+            msg = getattr(scene_before, "error_message", "") or "取得失敗"
+            return Response(
+                {"status": "failed", "message": f"Before シーン（{before_year}年）を取得できませんでした。{msg}"},
+                status=200,
+            )
+
+        # ── 3. Fetch After scene ──────────────────────────────────────────────
+        try:
+            scene_after = fetch_scene_in_window(
+                area, after_start, after_end,
+                cloud_cover=cloud_cover, prefer_earliest=False,
+            )
+        except Exception as e:
+            area.delete()
+            return Response(
+                {"status": "error", "message": f"After シーン取得中にエラー: {e}"},
+                status=200,
+            )
+
+        if not scene_after or scene_after.status != "downloaded":
+            area.delete()
+            msg = getattr(scene_after, "error_message", "") or "取得失敗"
+            return Response(
+                {"status": "failed", "message": f"After シーン（{after_year}年）を取得できませんでした。{msg}"},
+                status=200,
+            )
+
+        # Guard: same scene selected for both → no meaningful comparison
+        if scene_before.id == scene_after.id:
+            area.delete()
+            return Response(
+                {"status": "failed", "message": "Before と After に同じシーンが選ばれました。年の範囲を広げてください。"},
+                status=200,
+            )
+
+        # ── 4. Generate 3-panel comparison image ─────────────────────────────
+        from .quick_detect import generate_quick_detect_image
+        try:
+            rel_path, img_stats = generate_quick_detect_image(
+                before_scene=scene_before,
+                after_scene=scene_after,
+                area=area,
+                veg_threshold=veg_threshold,
+                panel_size=panel_size,
+                before_year=before_year,
+                after_year=after_year,
+                before_label=(str(before_date) if before_date else ""),
+                after_label=(str(after_date) if after_date else ""),
+            )
+        except Exception as e:
+            area.delete()
+            return Response({"status": "error", "message": f"画像生成エラー: {e}"}, status=200)
+
+        if rel_path is None:
+            area.delete()
+            err = img_stats.get("error", "画像生成に失敗しました")
+            return Response({"status": "failed", "message": err}, status=200)
+
+        # ── 5. Build image URL ────────────────────────────────────────────────
+        media_prefix = (settings.MEDIA_URL or "media/").strip("/")
+        prefix = f"/{media_prefix}" if media_prefix else ""
+        image_url = f"{prefix}/{rel_path}"
+
+        return Response({
+            "status": "success",
+            "image_url": image_url,
+            "before_scene_date": str(scene_before.scene_date),
+            "after_scene_date":  str(scene_after.scene_date),
+            "area_id": area.id,
+            **img_stats,
+        })
 
 
 def scene_preview_tile_serve(request, scene_id: int, subpath: str):
